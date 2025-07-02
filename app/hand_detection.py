@@ -9,6 +9,7 @@ class HandDetector:
         self.lock = threading.Lock()
 
         self.cap = cv2.VideoCapture(0)
+        # self.cap = cv2.VideoCapture(1) # if phone in range use this for laptop cam
         self.hands = mp.solutions.hands.Hands()
 
         self.thread = threading.Thread(target=self.detect_loop)
