@@ -1,91 +1,183 @@
+# main.py
 import numpy as np
 import pygame
+from .dungeon import Dungeon
+from .camera import Camera
+from .dungeon import TILE_WALL, TILE_FLOOR
 from .hand_detection import HandDetector
 from .game_objects import GameObject
 from .minimap import FogOfWar
+from .effects import draw_object_effect, death_counters, sparkle_counters
 
 # --- Constants ---
-WIDTH, HEIGHT = 800, 600
-FPS = 60
-LIGHT_RADIUS = 100
+SCREEN_WIDTH, SCREEN_HEIGHT = 800, 600
+TILE_SIZE = 24
+MAP_WIDTH, MAP_HEIGHT = 60, 45
+FPS = 30
+LIGHT_RADIUS = 7  # in tiles
+
+# --- Colors ---
+COLOR_WALL = (40, 40, 40)
+COLOR_FLOOR = (150, 150, 150)
+COLOR_PLAYER = (0, 0, 255)
+
+import cv2
 
 # --- Setup ---
 pygame.init()
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Torchlit Dungeon Crawler")
 clock = pygame.time.Clock()
 
-player_pos = np.array([WIDTH // 2, HEIGHT // 2])
+# Initialize dungeon
+dungeon = Dungeon(MAP_WIDTH, MAP_HEIGHT)
+start_x, start_y = dungeon.center(dungeon.rooms[0])
+player_tile = np.array([start_x, start_y])
+target_tile = player_tile.copy()
+camera = Camera(MAP_WIDTH, MAP_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT, TILE_SIZE)
+
+# Initialize objects
+room_cx, room_cy = dungeon.center(dungeon.rooms[1])
 objects = [
-    GameObject((300, 300), 'enemy_projectile'),
-    GameObject((500, 400), 'tree'),
-    GameObject((600, 200), 'loot')
+    GameObject((room_cx - 2, room_cy), 'enemy_projectile'),
+    GameObject((room_cx + 2, room_cy), 'enemy_projectile'),
+    GameObject((room_cx, room_cy - 2), 'tree'),
+    GameObject((room_cx, room_cy + 2), 'tree'),
+    GameObject((room_cx - 2, room_cy - 2), 'loot'),
+    GameObject((room_cx + 2, room_cy + 2), 'loot')
 ]
 
-fog = FogOfWar(map_size=(20, 15), tile_size=40)
+fog = FogOfWar(map_size=(MAP_WIDTH, MAP_HEIGHT), tile_size=TILE_SIZE)
 hand_detector = HandDetector()
 
-# --- Torch Flicker Variables ---
-flicker_angle = 0           # Angle for sine wave
-flicker_speed = 0.1         # Smaller = slower flicker
-flicker_amplitude = 5       # Max +/- pixels added to radius
+# Torch flicker setup
+flicker_angle = 0
+flicker_speed = 0.1
+flicker_amplitude = 1.0  # tile units
+show_minimap = True
+recording = False
+
+# Setup OpenCV video writer
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+out = cv2.VideoWriter('game_capture.avi', fourcc, FPS, (SCREEN_WIDTH, SCREEN_HEIGHT))
 
 # --- Main Loop ---
 running = True
 while running:
     clock.tick(FPS)
-    screen.fill((100, 100, 100))  # Background
+    screen.fill((0, 0, 0))
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            player_pos = np.array(pygame.mouse.get_pos())
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_q:
+                running = False
+            elif event.key == pygame.K_w:
+                target_tile[1] -= 1
+            elif event.key == pygame.K_s:
+                target_tile[1] += 1
+            elif event.key == pygame.K_a:
+                target_tile[0] -= 1
+            elif event.key == pygame.K_d:
+                target_tile[0] += 1
+            elif event.key == pygame.K_m:
+                show_minimap = not show_minimap
+            elif event.key == pygame.K_r:
+                recording = not recording
+                print(f"Recording {'started' if recording else 'stopped'}.")
 
-    # Interactions
-    for obj in objects:
-        obj.interact(player_pos)
-        if obj.type == 'enemy_projectile' and obj.health > 0:
-            pygame.draw.circle(screen, (255, 0, 0), obj.pos, 10)
-        elif obj.type == 'tree' and not obj.collected:
-            pygame.draw.circle(screen, (0, 255, 0), obj.pos, 10)
-        elif obj.type == 'loot' and not obj.collected:
-            pygame.draw.circle(screen, (255, 255, 0), obj.pos, 5)
+    target_tile[0] = np.clip(target_tile[0], 0, MAP_WIDTH - 1)
+    target_tile[1] = np.clip(target_tile[1], 0, MAP_HEIGHT - 1)
+    player_tile = target_tile.copy()
 
-    # Player
-    pygame.draw.circle(screen, (0, 0, 255), player_pos, 10)
+    # Center camera on player
+    camera.center_on(*player_tile)
 
-    # Torch logic
+    # Determine torch status before drawing
     hand_present = hand_detector.is_hand_detected()
-
     if hand_present:
-        # Smooth flicker
         flicker_angle += flicker_speed
-        flicker = int(flicker_amplitude * np.sin(flicker_angle))
+        flicker = flicker_amplitude * np.sin(flicker_angle)
         torch_radius = LIGHT_RADIUS + flicker
-
-        # Create lighting mask — fully dark everywhere
-        light_mask = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        light_mask.fill((0, 0, 0, 150))  # Global darkness
-
-        # Cut a clear circle for torchlight
-        pygame.draw.circle(light_mask, (0, 0, 0, 0), player_pos, torch_radius)
-        pygame.draw.circle(light_mask, (0, 0, 0, 80), player_pos, torch_radius + 40)
-
-        screen.blit(light_mask, (0, 0))
-        fog.update(player_pos, torch_radius)
+        fog.update(player_tile, int(torch_radius))
     else:
-        # No torch → just use full dim mask
-        dim_mask = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        dim_mask.fill((0, 0, 0, 150))
-        screen.blit(dim_mask, (0, 0))
+        torch_radius = 0
 
+    # Draw dungeon
+    for y in range(camera.y, camera.y + camera.tiles_high):
+        for x in range(camera.x, camera.x + camera.tiles_wide):
+            if 0 <= x < MAP_WIDTH and 0 <= y < MAP_HEIGHT:
+                tile = dungeon.tiles[y, x]
+                color = COLOR_WALL if tile == TILE_WALL else COLOR_FLOOR
+                sx, sy = camera.to_screen(x, y)
+                pygame.draw.rect(screen, color, (sx, sy, TILE_SIZE, TILE_SIZE))
 
-    # Minimap
-    fog.draw_minimap(screen)
+    # Draw fog of war before objects
+    if hasattr(fog, 'draw'):
+        fog.draw(screen, camera)
+
+    # Object interaction and rendering
+    updated_objects = []
+    for obj in objects:
+        obj.interact(player_tile)
+        draw_object_effect(screen, obj, camera, TILE_SIZE)
+
+        # Draw CV-style bounding box and label for visible objects
+        sx, sy = camera.to_screen(*obj.pos)
+        rect = pygame.Rect(sx, sy, TILE_SIZE, TILE_SIZE)
+
+        if obj.type == 'enemy_projectile':
+            label_color = (255, 0, 0)
+        elif obj.type == 'tree':
+            label_color = (0, 255, 0)
+        elif obj.type == 'loot':
+            label_color = (255, 255, 0)
+        else:
+            label_color = (255, 255, 255)
+
+        if 0 <= sx < SCREEN_WIDTH and 0 <= sy < SCREEN_HEIGHT:
+            pygame.draw.rect(screen, label_color, rect, 1)
+            font = pygame.font.SysFont(None, 16)
+            label = font.render(obj.type, True, label_color)
+            screen.blit(label, (sx, sy - 10))
+        pos_key = tuple(obj.pos)
+
+        if (obj.type == 'enemy_projectile' and obj.health <= 0 and pos_key not in death_counters) or \
+           (obj.type == 'tree' and obj.collected and pos_key not in death_counters) or \
+           (obj.type == 'loot' and obj.collected and pos_key not in sparkle_counters):
+            continue  # skip fully expired object
+
+        updated_objects.append(obj)
+
+    objects = updated_objects
+
+    # Draw player
+    px, py = camera.to_screen(*player_tile)
+    pygame.draw.rect(screen, COLOR_PLAYER, (px, py, TILE_SIZE, TILE_SIZE))
+
+    # Lighting Mask
+    light_mask = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    if hand_present:
+        light_mask.fill((0, 0, 0, 200))
+        pygame.draw.circle(light_mask, (0, 0, 0, 0), (px + TILE_SIZE//2, py + TILE_SIZE//2), int(torch_radius * TILE_SIZE))
+    else:
+        light_mask.fill((0, 0, 0, 200))
+    screen.blit(light_mask, (0, 0))
+
+    # Minimap toggleable
+    if show_minimap:
+        fog.draw_minimap(screen)
 
     pygame.display.flip()
 
-# Cleanup
+    # Capture frame to OpenCV video
+    if recording:
+        frame_str = pygame.image.tostring(screen, 'RGB')
+        frame_np = np.frombuffer(frame_str, dtype=np.uint8).reshape((SCREEN_HEIGHT, SCREEN_WIDTH, 3))
+        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+
 hand_detector.stop()
+out.release()
 pygame.quit()
